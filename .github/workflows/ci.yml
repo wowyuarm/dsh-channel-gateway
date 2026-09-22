@@ -1,0 +1,75 @@
+# CI gate: the package's own contract on clean Linux and Windows runners.
+#
+# Self-contained on purpose. The package depends on PUBLISHED @deepseek-ai
+# packages (cordis, schemastery), so a clean checkout has nothing to clone and
+# no sibling directory to resolve. Everything below runs from a bare checkout.
+#
+# Scope guard: one workflow, two jobs, exactly the checks the package exposes —
+# no coverage matrix, no release automation, no publish step. The windows lane is
+# the regression fence for path, identifier and file-name handling on a real
+# Windows filesystem.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+    # Docs-only pushes skip the gate: Markdown never reaches code.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+# Least privilege: the jobs only read this repository.
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        # Runs the package boundary check first, then the unit tests.
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

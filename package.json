@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Channel gateway for DeepSeek Harness: normalize provider traffic into one message contract, announce inbound messages as one typed event, authorize at the transport boundary.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wowyuarm/dsh-channel-gateway.git"
+  },
   "type": "module",
   "keywords": [
     "channel",
