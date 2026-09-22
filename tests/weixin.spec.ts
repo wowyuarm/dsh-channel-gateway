@@ -1,0 +1,228 @@
+import { describe, expect, it } from 'vitest'
+import { WEIXIN_MAX_TEXT_LENGTH, createWeixinChannel } from '../src/adapters/weixin.ts'
+import type { ChannelInbox, InboundMessage } from '../src/contracts.ts'
+import { ChannelGatewayError } from '../src/errors.ts'
+
+interface RecordedCall {
+  readonly endpoint: string
+  readonly headers: Record<string, string>
+  readonly body: Record<string, unknown>
+  readonly signal: AbortSignal | undefined
+}
+
+type Responder = (
+  endpoint: string,
+  body: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+) => unknown
+
+/** An iLink stand-in: every call is recorded, every answer is scripted. */
+function fakeWeixin(respond: Responder) {
+  const calls: RecordedCall[] = []
+  const impl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = String(input)
+    const endpoint = url.split('/ilink/bot/')[1] ?? url
+    const headers = (init?.headers ?? {}) as Record<string, string>
+    const body = init?.body === undefined
+      ? {}
+      : JSON.parse(String(init.body)) as Record<string, unknown>
+    calls.push({ endpoint, headers, body, signal: init?.signal ?? undefined })
+    const payload = await respond(endpoint, body, init?.signal ?? undefined)
+    return { ok: true, status: 200, json: () => Promise.resolve(payload) } as unknown as Response
+  }) as unknown as typeof fetch
+  return { impl, calls }
+}
+
+async function waitFor(check: () => boolean, timeoutMs = 500): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for the adapter')
+    await new Promise(resolve => { setTimeout(resolve, 1) })
+  }
+}
+
+/** The first poll answers with one page; every later poll waits for stop. */
+function pollOnce(page: unknown, ...rest: readonly Responder[]): Responder {
+  let polls = 0
+  return (endpoint, body, signal) => {
+    if (endpoint !== 'getupdates') {
+      const other = rest[0]
+      if (other === undefined) throw new Error(`unexpected ${endpoint}`)
+      return other(endpoint, body, signal)
+    }
+    polls += 1
+    if (polls === 1) return page
+    return new Promise((_resolve, reject) => {
+      signal?.addEventListener('abort', () => { reject(new Error('aborted')) }, { once: true })
+    })
+  }
+}
+
+const textMessage = {
+  message_id: 501,
+  from_user_id: 'wxid_peer',
+  to_user_id: 'bot',
+  create_time_ms: 1_789_000_000_000,
+  message_type: 1,
+  context_token: 'ctx-token',
+  item_list: [{ type: 1, text_item: { text: '你好' } }],
+}
+
+describe('weixin channel', () => {
+  it('normalizes a direct message and carries the context token in its route', async () => {
+    const { impl, calls } = fakeWeixin(pollOnce({ get_updates_buf: 'cursor-1', msgs: [textMessage] }))
+    const channel = createWeixinChannel({ token: 'TOKEN', fetch: impl, retryDelayMs: 1 })
+    const seen: InboundMessage[] = []
+    await channel.start({ deliver: message => { seen.push(message) } })
+    await waitFor(() => seen.length > 0)
+    await channel.stop()
+
+    const message = seen[0]
+    expect(message).toMatchObject({
+      channel: 'weixin',
+      providerMessageId: '501',
+      actor: { id: 'wxid_peer' },
+      place: { kind: 'direct' },
+      visibility: 'private',
+      text: '你好',
+      timestamp: new Date(1_789_000_000_000).toISOString(),
+    })
+    expect(message?.place.route.startsWith('wx:')).toBe(true)
+    expect(calls[0]?.headers.authorization).toBe('Bearer TOKEN')
+    expect(calls[0]?.headers['x-wechat-uin']).toBeTruthy()
+    expect(calls[0]?.body.get_updates_buf).toBe('')
+  })
+
+  it('sends the cursor the server handed back on the next poll', async () => {
+    const { impl, calls } = fakeWeixin(pollOnce({ get_updates_buf: 'cursor-7', msgs: [] }))
+    const channel = createWeixinChannel({ token: 'TOKEN', fetch: impl, retryDelayMs: 1 })
+    await channel.start({ deliver: () => {} })
+    await waitFor(() => calls.filter(call => call.endpoint === 'getupdates').length >= 2)
+    await channel.stop()
+
+    expect(calls[1]?.body.get_updates_buf).toBe('cursor-7')
+  })
+
+  it('skips its own messages and messages with no sender', async () => {
+    const page = {
+      get_updates_buf: 'c',
+      msgs: [
+        { ...textMessage, message_id: 600, message_type: 2 },
+        { ...textMessage, message_id: 601, from_user_id: '' },
+        { ...textMessage, message_id: 602, group_id: 'room-1', item_list: [{ type: 1, text_item: { text: 'hi all' } }] },
+      ],
+    }
+    const { impl } = fakeWeixin(pollOnce(page))
+    const channel = createWeixinChannel({ token: 'TOKEN', fetch: impl, retryDelayMs: 1 })
+    const seen: InboundMessage[] = []
+    await channel.start({ deliver: message => { seen.push(message) } })
+    await waitFor(() => seen.length > 0)
+    await channel.stop()
+
+    expect(seen.map(message => message.providerMessageId)).toEqual(['602'])
+    expect(seen[0]?.place.kind).toBe('group')
+    expect(seen[0]?.visibility).toBe('group')
+  })
+
+  it('reports media items without pretending it can fetch them', async () => {
+    const page = {
+      msgs: [{
+        ...textMessage,
+        item_list: [
+          { type: 1, text_item: { text: 'see this' } },
+          { type: 2, msg_id: 'm-1', image_item: { url: 'https://cdn.test/a.jpg', mid_size: 2048 } },
+          { type: 4, msg_id: 'm-2', file_item: { file_name: 'plan.pdf', len: '4096' } },
+        ],
+      }],
+    }
+    const { impl } = fakeWeixin(pollOnce(page))
+    const channel = createWeixinChannel({ token: 'TOKEN', fetch: impl, retryDelayMs: 1 })
+    const seen: InboundMessage[] = []
+    await channel.start({ deliver: message => { seen.push(message) } })
+    await waitFor(() => seen.length > 0)
+    await channel.stop()
+
+    expect(seen[0]?.attachments).toEqual([
+      { kind: 'image', url: 'https://cdn.test/a.jpg', size: 2048, ref: 'm-1' },
+      { kind: 'file', name: 'plan.pdf', size: 4096, ref: 'm-2' },
+    ])
+    expect(channel.capabilities.attachments).toBe(false)
+  })
+
+  it('stops polling when the token is stale instead of retrying forever', async () => {
+    const { impl, calls } = fakeWeixin(pollOnce({ errcode: -14, errmsg: 'token expired' }))
+    const channel = createWeixinChannel({ token: 'TOKEN', fetch: impl, retryDelayMs: 1 })
+    await channel.start({ deliver: () => {} })
+    await waitFor(() => calls.length >= 1)
+    await new Promise(resolve => { setTimeout(resolve, 20) })
+
+    expect(calls.filter(call => call.endpoint === 'getupdates')).toHaveLength(1)
+    await channel.stop()
+  })
+
+  it('sends a reply that quotes the route it was handed', async () => {
+    const { impl, calls } = fakeWeixin(pollOnce(
+      { msgs: [textMessage] },
+      () => ({}),
+    ))
+    const channel = createWeixinChannel({ token: 'TOKEN', fetch: impl, retryDelayMs: 1 })
+    const seen: InboundMessage[] = []
+    const inbox: ChannelInbox = { deliver: message => { seen.push(message) } }
+    await channel.start(inbox)
+    await waitFor(() => seen.length > 0)
+
+    const result = await channel.send({
+      channel: 'weixin',
+      route: seen[0]?.place.route ?? '',
+      text: '收到',
+    })
+    await channel.stop()
+
+    const sent = calls.find(call => call.endpoint === 'sendmessage')
+    expect(sent?.headers.authorization).toBe('Bearer TOKEN')
+    expect(sent?.body.msg).toMatchObject({
+      from_user_id: '',
+      to_user_id: 'wxid_peer',
+      message_type: 2,
+      message_state: 2,
+      context_token: 'ctx-token',
+      item_list: [{ type: 1, text_item: { text: '收到' } }],
+    })
+    expect(result.providerMessageId.startsWith('dsh-channel-gateway:')).toBe(true)
+  })
+
+  it('splits text longer than one message', async () => {
+    const { impl, calls } = fakeWeixin(pollOnce(
+      { msgs: [textMessage] },
+      () => ({}),
+    ))
+    const channel = createWeixinChannel({ token: 'TOKEN', fetch: impl, retryDelayMs: 1 })
+    const seen: InboundMessage[] = []
+    await channel.start({ deliver: message => { seen.push(message) } })
+    await waitFor(() => seen.length > 0)
+
+    await channel.send({
+      channel: 'weixin',
+      route: seen[0]?.place.route ?? '',
+      text: 'y'.repeat(WEIXIN_MAX_TEXT_LENGTH + 1),
+    })
+    await channel.stop()
+
+    const sends = calls.filter(call => call.endpoint === 'sendmessage')
+    expect(sends).toHaveLength(2)
+    const first = sends[0]?.body.msg as { item_list?: readonly { text_item?: { text?: string } }[] } | undefined
+    expect(first?.item_list?.[0]?.text_item?.text).toHaveLength(WEIXIN_MAX_TEXT_LENGTH)
+  })
+
+  it('refuses a foreign route, an attachment, and an empty send', async () => {
+    const { impl } = fakeWeixin(() => ({}))
+    const channel = createWeixinChannel({ token: 'TOKEN', fetch: impl })
+
+    await expect(channel.send({ channel: 'weixin', route: 'telegram:chat:1', text: 'x' }))
+      .rejects.toThrow(ChannelGatewayError)
+    await expect(channel.send({ channel: 'weixin', route: 'wx:YQ==.', text: '', attachments: [{ kind: 'image', url: 'https://x.test/a.png' }] }))
+      .rejects.toThrow(/text only/)
+    await expect(channel.send({ channel: 'weixin', route: 'wx:YQ==.', text: '' }))
+      .rejects.toThrow(ChannelGatewayError)
+  })
+})
