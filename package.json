@@ -48,7 +48,8 @@
     "check:boundaries": "node scripts/check-boundaries.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test": "npm run check:boundaries && vitest run",
-    "build": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc -p tsconfig.build.json"
+    "build": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "prepack": "npm run build"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
