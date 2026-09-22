@@ -10,11 +10,14 @@
  * HTTP client they need, and nothing else.
  */
 import { readdirSync, readFileSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const SRC = join(ROOT, 'src')
+
+/** `relative()` speaks the host separator; this guard speaks POSIX. */
+const posix = (path) => path.split(sep).join('/')
 
 /** Peers the core may name, by package base name. */
 const CORE_PACKAGES = new Set(['@deepseek-ai/cordis', '@deepseek-ai/schemastery'])
@@ -45,7 +48,7 @@ function packageOf(specifier) {
 const violations = []
 for (const file of sourceFiles(SRC)) {
   const source = readFileSync(file, 'utf8')
-  const isAdapter = relative(SRC, file).startsWith('adapters/')
+  const isAdapter = posix(relative(SRC, file)).startsWith('adapters/')
   const allowed = isAdapter ? new Set([...CORE_PACKAGES, ...ADAPTER_PACKAGES]) : CORE_PACKAGES
   const specifiers = []
   for (const match of source.matchAll(FROM_RE)) specifiers.push(match[1])
@@ -55,7 +58,7 @@ for (const file of sourceFiles(SRC)) {
     if (specifier.startsWith('node:')) continue
     const name = packageOf(specifier)
     if (name !== undefined && allowed.has(name)) continue
-    violations.push(`${relative(ROOT, file)} imports '${specifier}'`)
+    violations.push(`${posix(relative(ROOT, file))} imports '${specifier}'`)
   }
 }
 
