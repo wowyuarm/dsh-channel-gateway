@@ -18,7 +18,7 @@ function testChannel(name: string, options: TestChannelOptions = {}) {
   let stops = 0
   const channel: Channel = {
     name,
-    capabilities: { attachments: false, buttons: false, edit: false, replyTo: false, maxTextLength: 100 },
+    capabilities: { attachments: false, attachmentDownload: false, buttons: false, edit: false, replyTo: false, maxTextLength: 100 },
     start(inbox) {
       if (options.failStart === true) return Promise.reject(new Error('no transport'))
       inboxes.push(inbox)
@@ -181,5 +181,33 @@ describe('ChannelGateway', () => {
 
     expect(registered.stops()).toBe(1)
     expect(ctx.channels.channels).toEqual([])
+  })
+
+  it('resolves an attachment through the channel that reported it', async () => {
+    const { ctx } = await mount()
+    const bytes = new Uint8Array([9, 8, 7])
+    const base = testChannel('withMedia')
+    const channel: Channel = {
+      ...base.channel,
+      resolveAttachment: () => Promise.resolve({ bytes, mimeType: 'image/png' }),
+    }
+    ctx.channels.register(channel)
+    await settle()
+
+    const resolved = await ctx.channels.resolveAttachment('withMedia', { kind: 'image', ref: 'r' })
+    expect(resolved.bytes).toBe(bytes)
+    expect(resolved.mimeType).toBe('image/png')
+  })
+
+  it('refuses to resolve for an unknown or unsupporting channel', async () => {
+    const { ctx } = await mount()
+    const registered = testChannel('plain')
+    ctx.channels.register(registered.channel)
+    await settle()
+
+    await expect(ctx.channels.resolveAttachment('missing', { kind: 'image', ref: 'r' }))
+      .rejects.toThrow(ChannelGatewayError)
+    await expect(ctx.channels.resolveAttachment('plain', { kind: 'image', ref: 'r' }))
+      .rejects.toThrow(ChannelGatewayError)
   })
 })

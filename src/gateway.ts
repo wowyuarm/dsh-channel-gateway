@@ -12,11 +12,13 @@ import { Service, type Context } from '@deepseek-ai/cordis'
 import { allowlistAuth, type ChannelAuth } from './auth.ts'
 import type {
   Channel,
+  ChannelAttachment,
   ChannelInbox,
   ChannelSendResult,
   InboundMessage,
   OutboundMessage,
   RegisteredChannel,
+  ResolvedAttachment,
 } from './contracts.ts'
 import { ChannelGatewayError, errorText } from './errors.ts'
 
@@ -100,6 +102,22 @@ export class ChannelGateway extends Service {
       throw new ChannelGatewayError(`no channel "${message.channel}" is registered; registered: ${this.names()}`)
     }
     return await channel.send(message)
+  }
+
+  /**
+   * Fetch the content behind an inbound attachment through the channel that
+   * reported it. The channel must be registered and must support attachment
+   * download; the gateway carries the bytes back without storing them.
+   */
+  async resolveAttachment(channel: string, attachment: ChannelAttachment): Promise<ResolvedAttachment> {
+    const registered = this.registered.get(channel)
+    if (registered === undefined) {
+      throw new ChannelGatewayError(`no channel "${channel}" is registered; registered: ${this.names()}`)
+    }
+    if (registered.resolveAttachment === undefined) {
+      throw new ChannelGatewayError(`channel "${channel}" cannot fetch attachment content`)
+    }
+    return await registered.resolveAttachment(attachment)
   }
 
   /**

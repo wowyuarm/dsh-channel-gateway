@@ -303,4 +303,46 @@ describe('telegram channel', () => {
     await channel.stop()
     expect(polls).toBeGreaterThanOrEqual(2)
   })
+
+  it('resolves an inbound attachment by fetching its file bytes', async () => {
+    const bytes = Buffer.from('telegram image bytes', 'utf8')
+    const impl = (async (input: Parameters<typeof fetch>[0]) => {
+      const url = String(input)
+      if (url.endsWith('/getFile')) {
+        return { ok: true, status: 200, json: () => Promise.resolve({ ok: true, result: { file_id: 'F', file_path: 'photos/x.jpg' } }) } as unknown as Response
+      }
+      if (url.endsWith('/file/botT/photos/x.jpg')) {
+        return { ok: true, status: 200, arrayBuffer: () => Promise.resolve(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)) } as unknown as Response
+      }
+      throw new Error(`unexpected ${url}`)
+    }) as unknown as typeof fetch
+    const channel = createTelegramChannel({ token: 'T', fetch: impl })
+
+    const resolved = await channel.resolveAttachment?.({ kind: 'image', ref: 'F' })
+    expect(resolved && Buffer.from(resolved.bytes).equals(bytes)).toBe(true)
+    expect(resolved?.name).toBe('x.jpg')
+  })
+
+  it('uploads local bytes as a multipart attachment', async () => {
+    let uploaded: unknown
+    const impl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const url = String(input)
+      if (url.endsWith('/sendDocument')) {
+        uploaded = init?.body
+        return { ok: true, status: 200, json: () => Promise.resolve({ ok: true, result: { message_id: 9 } }) } as unknown as Response
+      }
+      throw new Error(`unexpected ${url}`)
+    }) as unknown as typeof fetch
+    const channel = createTelegramChannel({ token: 'T', fetch: impl })
+
+    const result = await channel.send({
+      channel: 'telegram',
+      route: 'chat:1',
+      text: '',
+      attachments: [{ kind: 'file', name: 'a.txt', data: new Uint8Array([1, 2, 3]) }],
+    })
+
+    expect(result.providerMessageId).toBe('9')
+    expect(uploaded instanceof FormData).toBe(true)
+  })
 })

@@ -31,7 +31,7 @@ that a consumer can implement them without the gateway having to.
 | `place` | Where: `{ route, kind, title? }`. |
 | `visibility` | `private` (only the actor) or `group` (others in the place can see it). |
 | `text` | The message text, or `''` when the provider carried none. |
-| `attachments` | Zero or more `ChannelAttachment`, as far as the transport could describe them. |
+| `attachments` | Zero or more `ChannelAttachment`, as far as the transport could describe them. Their content is fetched on demand through `resolveAttachment`, never eagerly. |
 | `timestamp` | ISO 8601 UTC, from the provider's own timestamp. |
 | `replyTo` | The provider message id this message answers, when it answers one. |
 | `raw` | The provider payload the adapter normalized, untouched, for consumers that need more than the contract carries. |
@@ -49,20 +49,34 @@ from parts is unsupported: no layer above the adapter knows the scheme.
 
 ### `OutboundMessage`
 
-`{ channel, route, text, attachments?, replyTo? }`. The gateway resolves
+`{ channel, route, text, attachments?, replyTo?, format? }`. The gateway resolves
 `channel` to a registered adapter and hands the message over; a route the
 adapter never minted is the adapter's rejection to raise, because only it knows
 its own scheme.
+
+`format` chooses how the channel renders `text`: `markdown` becomes that
+provider's own formatted dialect (Telegram HTML, sanitized WeChat Markdown), and
+omitted (`plain`) sends the text verbatim, so a consumer that has not opted in
+sees no transformation. An outbound `ChannelAttachment` may carry `data` (raw
+bytes) for the channel to upload, instead of a provider `url` or `ref`.
+
+### `ResolvedAttachment`
+
+`{ bytes, mimeType?, name? }` — the content behind an inbound attachment, once a
+channel has fetched and (where the provider encrypts them) decrypted it. Bytes
+rather than a URL or a path: a provider URL may embed the bot's own credential,
+and where the bytes live afterwards is the caller's decision.
 
 ### `Channel`
 
 | Member | Contract |
 | --- | --- |
 | `name` | Unique within a gateway; also the `channel` field of every message it reports. |
-| `capabilities` | `{ attachments, buttons, edit, replyTo, maxTextLength }` — what a consumer may ask for, so it need not guess. |
+| `capabilities` | `{ attachments, attachmentDownload, buttons, edit, replyTo, maxTextLength }` — what a consumer may ask for, so it need not guess. |
 | `start(inbox)` | Begin receiving; resolving means receiving has started, not finished. A rejection is a failed start: the gateway unregisters the channel and reports it. |
 | `stop()` | Stop receiving and release resources; safe after a failed start and after a first stop. |
-| `send(message)` | Send one message; returns the provider's id for what it created. |
+| `send(message)` | Send one message; returns the provider's id for what it created. An attachment uploads from `data`, else references a provider `url`/`ref`. |
+| `resolveAttachment(attachment)` | Present when `capabilities.attachmentDownload`; returns the `ResolvedAttachment` behind one inbound attachment. The gateway exposes the same call as `ctx.channels.resolveAttachment(channel, attachment)`, routing to the channel that reported it. |
 
 ## Lifecycle
 
@@ -133,11 +147,14 @@ owns that work — the acceptance step a consumer is expected to implement.
 
 Updates with no message, and messages with no sender (channel posts), are
 skipped — but the poll offset still advances past them, so one unusable update
-cannot block the stream behind it. Sends split text at 4096 characters, breaking
+cannot block the stream behind it. A silently wedged long poll is aborted by a
+client-side watchdog and restarted. Sends split text at 4096 characters, breaking
 at the last line break in range, else the last space, else the limit — never
 between the two halves of a surrogate pair, and the chunks join back to the
-original text. An attachment is sent by its provider `ref` or `url`; a local
-upload is not part of this adapter.
+original text; a transient send failure is retried with backoff, honouring the
+API's `retry_after`. An attachment sends from local `data` as a multipart
+upload, else by its provider `ref` or `url`; `resolveAttachment` reads an inbound
+attachment's bytes through `getFile` and a file download.
 
 ### Weixin
 
@@ -149,12 +166,15 @@ upload is not part of this adapter.
 | `place.kind` | `group_id` present → `group`, otherwise `direct` |
 | `visibility` | as `place.kind` |
 | `text` | `text_item.text` values, or a voice item's transcript |
-| `attachments` | `image_item`/`voice_item`/`file_item`/`video_item`, carrying `url`, `name`, `size` and `msg_id` as `ref` |
+| `attachments` | `image_item`/`voice_item`/`file_item`/`video_item`; the download locator and key are packed into `ref`, so `resolveAttachment` can fetch and AES-128-ECB-decrypt the bytes |
 | `timestamp` | `create_time_ms` |
 
 A message whose `message_type` is `2` is this bot's own send coming back, and is
 not inbound. `errcode -14` means the token is stale: polling stops rather than
-retrying forever.
+retrying forever. Before a send, a context token past its trusted window is
+refreshed through `getconfig`. Outbound media is uploaded to the iLink CDN
+(AES-128-ECB, per `getuploadurl`) and sent as a media item; a transient send
+failure is retried with backoff.
 
 ## Host compatibility
 
@@ -178,12 +198,13 @@ README is the host-side guard, run by hand when a DSH line advances.
 
 - **Weixin has no login flow.** It starts from a token it is given; the iLink QR
   login, credential persistence and re-login are not implemented.
-- **Weixin is text-only outbound.** Inbound media is reported (`capabilities.attachments`
-  is `false`), but fetching and sending media needs the CDN upload/decrypt path.
-- **A reply after ~2 minutes may fail on WeChat**, because the context token in
-  the route has expired by then. That is the provider's rule rather than a
-  policy this layer applies: a consumer that must answer later needs a fresh
-  inbound message.
+- **Weixin media is reverse-engineered.** Download (AES decrypt) and upload
+  (CDN) follow the reference iLink client via `nanobot`, not official docs, and
+  are not yet verified against a live account.
+- **A reply after ~2 minutes may still fail on WeChat.** The adapter refreshes a
+  stale context token before sending, but a token that is long dead cannot be
+  refreshed; a consumer that must answer much later needs a fresh inbound
+  message. That expiry is the provider's rule, not a policy this layer applies.
 - **No webhook transport.** Both adapters poll. A webhook channel would need an
   injected HTTP server; the `Channel` interface already accommodates one (`start`
   receives a host object), but nothing consumes `ctx.webServer` yet.

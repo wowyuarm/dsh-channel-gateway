@@ -14,9 +14,9 @@
 | 面 | 形状 |
 | --- | --- |
 | 入站 | `InboundMessage { channel, providerMessageId, actor, place, visibility, text, attachments?, timestamp, replyTo?, raw? }` |
-| 出站 | `OutboundMessage { channel, route, text, attachments?, replyTo? }` |
-| 传输 | `Channel { name, capabilities, start(inbox), stop(), send(message) }` |
-| 网关 | `ctx.channels.register(channel)` · `ctx.channels.send(message)` · 事件 `channel/inbound` |
+| 出站 | `OutboundMessage { channel, route, text, attachments?, replyTo?, format? }` |
+| 传输 | `Channel { name, capabilities, start(inbox), stop(), send(message), resolveAttachment? }` |
+| 网关 | `ctx.channels.register(channel)` · `ctx.channels.send(message)` · `ctx.channels.resolveAttachment(channel, attachment)` · 事件 `channel/inbound` |
 | 鉴权 | `ChannelAuth { authorize(request) }`，默认 allowlist |
 
 契约中有三处是消费方需要、而 provider 给不出可用形态的：
@@ -80,8 +80,8 @@ export function apply(ctx: Context) {
 
 | 适配器 | 传输 | 入口 | 说明 |
 | --- | --- | --- | --- |
-| Telegram | Bot API 长轮询（`getUpdates`） | `@wowyuarm/dsh-channel-gateway/telegram` | 文本/文档/图片/音频/视频；附件以 provider `ref` 或 URL 发送，不做本地上传。`config.token` 缺省回落到 `DSH_TELEGRAM_TOKEN`。 |
-| 微信 | iLink 长轮询（`ilink/bot/getupdates`） | `@wowyuarm/dsh-channel-gateway/weixin` | 仅文本。回复要带上入站消息的 `context_token`，微信侧约两分钟后过期；媒体只上报不拉取、不发送。需要一个已获得的 token——扫码登录流程尚未实现。 |
+| Telegram | Bot API 长轮询（`getUpdates`） | `@wowyuarm/dsh-channel-gateway/telegram` | 文本与媒体。附件优先用本地字节（`data`）上传，否则用 provider `ref` 或 URL；`resolveAttachment` 通过下载取回入站附件的字节。`format: 'markdown'` 渲染为 Telegram HTML。`config.token` 缺省回落到 `DSH_TELEGRAM_TOKEN`。 |
+| 微信 | iLink 长轮询（`ilink/bot/getupdates`） | `@wowyuarm/dsh-channel-gateway/weixin` | 文本与媒体。回复要带上入站消息的 `context_token`，微信侧约两分钟后过期，发送前会刷新已过期的 token。`format: 'markdown'` 渲染为清洗后的微信 Markdown。媒体的上传/下载按 iLink 参考协议实现，**尚未在真实账号上验证**。需要一个已获得的 token——扫码登录流程尚未实现。 |
 
 两个适配器都尊重 `HTTPS_PROXY`/`NO_PROXY`（Node 自带 fetch 默认不读这两个变量）。
 

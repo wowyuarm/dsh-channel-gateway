@@ -65,6 +65,24 @@ export interface ChannelAttachment {
   readonly url?: string
   /** Channel-local handle for a later fetch; opaque to every other layer. */
   readonly ref?: string
+  /**
+   * Raw bytes to upload when sending. The channel puts them on the wire; the
+   * caller does not host or link them. Inbound attachments never carry this:
+   * to read inbound content, call {@link Channel.resolveAttachment}.
+   */
+  readonly data?: Uint8Array
+}
+
+/**
+ * The content behind an inbound {@link ChannelAttachment}, once a channel has
+ * fetched (and, where the provider encrypts them, decrypted) it. Bytes rather
+ * than a URL or a path: a provider URL may embed the bot's own credential, and
+ * where the bytes live afterwards is the caller's decision, not the gateway's.
+ */
+export interface ResolvedAttachment {
+  readonly bytes: Uint8Array
+  readonly mimeType?: string
+  readonly name?: string
 }
 
 /** One normalized inbound message. */
@@ -118,6 +136,8 @@ export interface ChannelSendResult {
 /** What a channel can do, so a consumer reads it instead of guessing. */
 export interface ChannelCapabilities {
   readonly attachments: boolean
+  /** Whether {@link Channel.resolveAttachment} can fetch an inbound attachment. */
+  readonly attachmentDownload: boolean
   readonly buttons: boolean
   readonly edit: boolean
   readonly replyTo: boolean
@@ -151,6 +171,12 @@ export interface Channel {
   stop(): Promise<void>
   /** Send one message. The route must be one this channel minted. */
   send(message: OutboundMessage): Promise<ChannelSendResult>
+  /**
+   * Fetch the content behind an inbound attachment's handle. Present only when
+   * {@link ChannelCapabilities.attachmentDownload} is true; the argument is an
+   * attachment this channel reported inbound, whose `ref` it minted.
+   */
+  resolveAttachment?(attachment: ChannelAttachment): Promise<ResolvedAttachment>
 }
 
 /** What the gateway knows about one registered channel. */

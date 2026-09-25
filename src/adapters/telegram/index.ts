@@ -23,6 +23,7 @@ import type {
   ChannelVisibility,
   InboundMessage,
   OutboundMessage,
+  ResolvedAttachment,
 } from '../../contracts.ts'
 import { ChannelGatewayError, errorText } from '../../errors.ts'
 import type {} from '../../gateway.ts'
@@ -79,6 +80,13 @@ interface TelegramMessage {
 interface TelegramUpdate {
   update_id: number
   message?: TelegramMessage
+}
+
+/** What `getFile` returns: the relative path a download reads from. */
+interface TelegramFile {
+  file_id: string
+  file_path?: string
+  file_size?: number
 }
 
 interface TelegramResponse<T> {
@@ -208,9 +216,15 @@ export function createTelegramChannel(options: TelegramChannelOptions): Channel 
     return message.split(token).join('***')
   }
 
-  async function call<T>(method: string, body?: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
-    const init: RequestInit = { method: 'POST', headers: { 'content-type': 'application/json' } }
-    if (body !== undefined) init.body = JSON.stringify(body)
+  async function call<T>(method: string, body?: Record<string, unknown> | FormData, signal?: AbortSignal): Promise<T> {
+    const init: RequestInit = { method: 'POST' }
+    if (body instanceof FormData) {
+      // Let fetch set the multipart content-type with its boundary.
+      init.body = body
+    } else if (body !== undefined) {
+      init.headers = { 'content-type': 'application/json' }
+      init.body = JSON.stringify(body)
+    }
     if (signal !== undefined) init.signal = signal
     let response: Response
     try {
@@ -280,14 +294,54 @@ export function createTelegramChannel(options: TelegramChannelOptions): Channel 
     const field = attachment.kind === 'image'
       ? 'photo'
       : attachment.kind === 'video' ? 'video' : attachment.kind === 'audio' ? 'audio' : 'document'
+    if (attachment.data !== undefined) {
+      // Upload local bytes as multipart, so the caller can send content it holds
+      // rather than only a url or a file the provider already hosts.
+      const form = new FormData()
+      form.append('chat_id', String(chatId))
+      const blob = new Blob([attachment.data], attachment.mimeType === undefined ? {} : { type: attachment.mimeType })
+      form.append(field, blob, attachment.name ?? `${attachment.kind}.bin`)
+      const uploaded = await withRetry(() => call<TelegramMessage>(method, form), sendPolicy)
+      return uploaded.message_id
+    }
     const handle = attachment.url ?? attachment.ref
     if (handle === undefined) {
       throw new ChannelGatewayError(
-        `telegram cannot send a ${attachment.kind} attachment without a url or a ref; local uploads are not part of this adapter`,
+        `telegram cannot send a ${attachment.kind} attachment without data, a url, or a ref`,
       )
     }
     const sent = await withRetry(() => call<TelegramMessage>(method, { chat_id: chatId, [field]: handle }), sendPolicy)
     return sent.message_id
+  }
+
+  /** Fetch and return the bytes behind an inbound attachment's file_id. */
+  async function resolveAttachment(attachment: ChannelAttachment): Promise<ResolvedAttachment> {
+    const fileId = attachment.ref
+    if (fileId === undefined) {
+      throw new ChannelGatewayError('telegram cannot resolve an attachment without a file_id ref')
+    }
+    const file = await withRetry(() => call<TelegramFile>('getFile', { file_id: fileId }), sendPolicy)
+    if (file.file_path === undefined) {
+      throw new ChannelGatewayError(`telegram getFile returned no file_path for ${fileId}`)
+    }
+    let response: Response
+    try {
+      // The download endpoint is the file host, not the bot method host, and
+      // the path already encodes the file; this is a plain GET of the bytes.
+      response = await fetchImpl(`${apiBaseUrl}/file/bot${token}/${file.file_path}`)
+    } catch (error: unknown) {
+      throw new Error(redact(`telegram file download failed: ${errorText(error)}`))
+    }
+    if (!response.ok) {
+      throw new ChannelGatewayError(redact(`telegram file download was rejected: HTTP ${String(response.status)}`))
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer())
+    const name = attachment.name ?? file.file_path.split('/').at(-1)
+    return {
+      bytes,
+      ...(attachment.mimeType === undefined ? {} : { mimeType: attachment.mimeType }),
+      ...(name === undefined ? {} : { name }),
+    }
   }
 
   async function poll(inbox: ChannelInbox, signal: AbortSignal): Promise<void> {
@@ -329,6 +383,7 @@ export function createTelegramChannel(options: TelegramChannelOptions): Channel 
 
   const capabilities: ChannelCapabilities = {
     attachments: true,
+    attachmentDownload: true,
     buttons: false,
     edit: false,
     replyTo: true,
@@ -376,6 +431,7 @@ export function createTelegramChannel(options: TelegramChannelOptions): Channel 
       }
       return { providerMessageId: String(last) }
     },
+    resolveAttachment,
   }
 }
 

@@ -15,7 +15,7 @@
  */
 
 import { readFileSync } from 'node:fs'
-import { randomBytes, randomInt } from 'node:crypto'
+import { createHash, randomBytes, randomInt } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import type {
@@ -30,6 +30,7 @@ import type {
   ChannelVisibility,
   InboundMessage,
   OutboundMessage,
+  ResolvedAttachment,
 } from '../../contracts.ts'
 import { ChannelGatewayError, errorText } from '../../errors.ts'
 import type {} from '../../gateway.ts'
@@ -37,12 +38,16 @@ import { delay, proxyAwareFetch, withRetry } from '../http.ts'
 import { silentLog, type AdapterLog } from '../log.ts'
 import { splitText } from '../text.ts'
 import { splitWeixinMarkdown } from './markdown.ts'
+import { decryptAesEcb, encryptAesEcb } from './crypto.ts'
 
 /** This adapter's own split threshold; a longer text becomes several messages. */
 export const WEIXIN_MAX_TEXT_LENGTH = 2048
 
 /** The public iLink bot endpoint family. */
 export const WEIXIN_DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com'
+
+/** Where iLink stores encrypted media; a download reads it, an upload writes it. */
+export const WEIXIN_DEFAULT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c'
 
 /** iLink business codes worth naming; anything else is reported as it came. */
 const ERRCODE_CONTEXT_RESTRICTED = -2
@@ -54,6 +59,18 @@ const MESSAGE_TYPE_BOT = 2
 /** `message_state` of a finished message; `item.type` of a text item. */
 const MESSAGE_STATE_FINISH = 2
 const ITEM_TYPE_TEXT = 1
+
+/** `item.type` values, by media kind, for outbound media items. */
+const ITEM_TYPE_IMAGE = 2
+const ITEM_TYPE_VOICE = 3
+const ITEM_TYPE_FILE = 4
+const ITEM_TYPE_VIDEO = 5
+
+/** `media_type` values `getuploadurl` expects, by media kind. */
+const UPLOAD_MEDIA_IMAGE = 1
+const UPLOAD_MEDIA_VIDEO = 2
+const UPLOAD_MEDIA_FILE = 3
+const UPLOAD_MEDIA_VOICE = 4
 
 const ROUTE_PREFIX = 'wx:'
 
@@ -81,6 +98,14 @@ interface WeixinMedia {
   mid_size?: number
   file_name?: string
   len?: string
+  /** The hex AES key some items carry beside `media` (images use it first). */
+  aeskey?: string
+  /** Where the encrypted bytes live and the key to open them. */
+  media?: {
+    full_url?: string
+    encrypt_query_param?: string
+    aes_key?: string
+  }
 }
 
 interface WeixinItem {
@@ -120,12 +145,35 @@ interface GetConfigResponse {
   context_token?: string
 }
 
+/** The `getuploadurl` reply: where to PUT the encrypted bytes. */
+interface GetUploadUrlResponse {
+  upload_full_url?: string
+  upload_param?: string
+}
+
+/**
+ * What a later `resolveAttachment` needs to fetch and decrypt one inbound media
+ * item, packed into the attachment's opaque `ref`. Short keys keep the ref
+ * compact: `k` kind, `u` full url, `e` encrypt_query_param, `a` media aes key
+ * (base64), `h` item aes key (hex), `n` file name.
+ */
+interface WeixinMediaRef {
+  k: ChannelAttachment['kind']
+  u?: string
+  e?: string
+  a?: string
+  h?: string
+  n?: string
+}
+
 /** How one weixin channel is built; the plugin row supplies it. */
 export interface WeixinChannelOptions {
   readonly token: string
   /** Injected for tests; defaults to a proxy-aware global fetch. */
   readonly fetch?: typeof fetch
   readonly baseUrl?: string
+  /** Where encrypted media is fetched and uploaded; defaults to the iLink CDN. */
+  readonly cdnBaseUrl?: string
   /** Long-poll timeout for the first request, before the server suggests one. */
   readonly pollTimeoutSec?: number
   readonly retryDelayMs?: number
@@ -178,7 +226,25 @@ function parseRoute(route: string): { userId: string; contextToken: string } {
   }
 }
 
-/** Media an inbound item carried: reported, never fetched by this adapter. */
+/**
+ * Pack what a later download needs into the attachment's opaque `ref`, or
+ * nothing when the item carries no locator to fetch from. The key and locator
+ * travel in the ref so `resolveAttachment` can work from the attachment alone.
+ */
+function mediaRefOf(kind: ChannelAttachment['kind'], value: WeixinMedia): string | undefined {
+  const fullUrl = value.media?.full_url?.trim() ?? ''
+  const encParam = value.media?.encrypt_query_param ?? ''
+  if (fullUrl === '' && encParam === '') return undefined
+  const ref: WeixinMediaRef = { k: kind }
+  if (fullUrl !== '') ref.u = fullUrl
+  if (encParam !== '') ref.e = encParam
+  if (value.media?.aes_key !== undefined && value.media.aes_key !== '') ref.a = value.media.aes_key
+  if (value.aeskey !== undefined && value.aeskey !== '') ref.h = value.aeskey
+  if (value.file_name !== undefined && value.file_name !== '') ref.n = value.file_name
+  return Buffer.from(JSON.stringify(ref), 'utf8').toString('base64url')
+}
+
+/** Media an inbound item carried, with the handle a download later reads. */
 function attachmentsOf(items: readonly WeixinItem[]): readonly ChannelAttachment[] {
   const found: ChannelAttachment[] = []
   for (const item of items) {
@@ -191,12 +257,12 @@ function attachmentsOf(items: readonly WeixinItem[]): readonly ChannelAttachment
     for (const [kind, value] of media) {
       if (value === undefined) continue
       const size = value.mid_size ?? (value.len === undefined ? undefined : Number(value.len))
+      const ref = mediaRefOf(kind, value)
       found.push({
         kind,
-        ...(value.url === undefined ? {} : { url: value.url }),
         ...(value.file_name === undefined ? {} : { name: value.file_name }),
         ...(size === undefined || !Number.isFinite(size) ? {} : { size }),
-        ...(item.msg_id === undefined ? {} : { ref: item.msg_id }),
+        ...(ref === undefined ? {} : { ref }),
       })
     }
   }
@@ -223,6 +289,7 @@ export function createWeixinChannel(options: WeixinChannelOptions): Channel {
   if (token === '') throw new ChannelGatewayError('the weixin channel needs an iLink bot token')
   const fetchImpl = options.fetch ?? proxyAwareFetch()
   const baseUrl = (options.baseUrl ?? WEIXIN_DEFAULT_BASE_URL).replace(/\/+$/, '')
+  const cdnBaseUrl = (options.cdnBaseUrl ?? WEIXIN_DEFAULT_CDN_BASE_URL).replace(/\/+$/, '')
   const retryDelayMs = options.retryDelayMs ?? 3000
   const log = options.log ?? silentLog
   const version = bundleVersion()
@@ -369,8 +436,157 @@ export function createWeixinChannel(options: WeixinChannelOptions): Channel {
     return token
   }
 
+  /** A send retries transport failures, but not a rejection the server means. */
+  const sendRetry = {
+    retries: 3,
+    baseDelayMs: 500,
+    isRetryable: (error: unknown): boolean => !(error instanceof WeixinApiError),
+    onRetry: (error: unknown, waitMs: number): void => {
+      log.error(`weixin: send failed, retrying in ${String(waitMs)}ms: ${errorText(error)}`)
+    },
+  }
+
+  /** Send one message whose items are already built (text or media). */
+  async function sendItems(userId: string, contextToken: string, clientId: string, itemList: readonly unknown[]): Promise<void> {
+    await withRetry(() => request('ilink/bot/sendmessage', {
+      msg: {
+        from_user_id: '',
+        to_user_id: userId,
+        client_id: clientId,
+        message_type: MESSAGE_TYPE_BOT,
+        message_state: MESSAGE_STATE_FINISH,
+        item_list: itemList,
+        ...(contextToken === '' ? {} : { context_token: contextToken }),
+      },
+    }, undefined), sendRetry)
+  }
+
+  /** The upload/item shapes iLink expects for one attachment kind. */
+  function mediaKindMapping(kind: ChannelAttachment['kind']): { uploadType: number; itemType: number; itemKey: string } {
+    switch (kind) {
+      case 'image': return { uploadType: UPLOAD_MEDIA_IMAGE, itemType: ITEM_TYPE_IMAGE, itemKey: 'image_item' }
+      case 'video': return { uploadType: UPLOAD_MEDIA_VIDEO, itemType: ITEM_TYPE_VIDEO, itemKey: 'video_item' }
+      case 'audio': return { uploadType: UPLOAD_MEDIA_VOICE, itemType: ITEM_TYPE_VOICE, itemKey: 'voice_item' }
+      default: return { uploadType: UPLOAD_MEDIA_FILE, itemType: ITEM_TYPE_FILE, itemKey: 'file_item' }
+    }
+  }
+
+  /**
+   * Upload one attachment's bytes to the iLink CDN and send it: ask for an
+   * upload URL, AES-encrypt and PUT the bytes, then send a media item that
+   * points at what the CDN stored. The caller supplies the bytes; this adapter
+   * owns the encryption the CDN requires.
+   */
+  async function uploadMedia(userId: string, contextToken: string, clientId: string, attachment: ChannelAttachment): Promise<void> {
+    if (attachment.data === undefined) {
+      throw new ChannelGatewayError(`weixin can only send a ${attachment.kind} attachment given its bytes; a url or ref is not enough`)
+    }
+    const raw = Buffer.from(attachment.data)
+    const rawMd5 = createHash('md5').update(raw).digest('hex')
+    const { uploadType, itemType, itemKey } = mediaKindMapping(attachment.kind)
+    const aesKeyRaw = randomBytes(16)
+    const aesKeyHex = aesKeyRaw.toString('hex')
+    // PKCS7 always adds 1..16 bytes, rounding the ciphertext up to a block.
+    const paddedSize = Math.ceil((raw.length + 1) / 16) * 16
+    const fileKey = randomBytes(16).toString('hex')
+
+    const upload = await request<GetUploadUrlResponse>('ilink/bot/getuploadurl', {
+      filekey: fileKey,
+      media_type: uploadType,
+      to_user_id: userId,
+      rawsize: raw.length,
+      rawfilemd5: rawMd5,
+      filesize: paddedSize,
+      no_need_thumb: true,
+      aeskey: aesKeyHex,
+    }, undefined)
+    const uploadFullUrl = upload.upload_full_url?.trim() ?? ''
+    const uploadParam = upload.upload_param ?? ''
+    if (uploadFullUrl === '' && uploadParam === '') {
+      throw new ChannelGatewayError('weixin getuploadurl returned no upload url')
+    }
+
+    const encrypted = encryptAesEcb(raw, aesKeyRaw.toString('base64'))
+    const cdnUploadUrl = uploadFullUrl !== ''
+      ? uploadFullUrl
+      : `${cdnBaseUrl}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(fileKey)}`
+    let cdnResponse: Response
+    try {
+      cdnResponse = await fetchImpl(cdnUploadUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: encrypted,
+      })
+    } catch (error: unknown) {
+      throw new Error(redact(`weixin media upload failed: ${errorText(error)}`))
+    }
+    if (!cdnResponse.ok) {
+      throw new ChannelGatewayError(`weixin media upload was rejected: HTTP ${String(cdnResponse.status)}`)
+    }
+    const downloadParam = cdnResponse.headers.get('x-encrypted-param') ?? ''
+    if (downloadParam === '') {
+      throw new ChannelGatewayError('weixin media upload response carried no x-encrypted-param header')
+    }
+
+    // The CDN download key is the hex key's ASCII bytes, base64-encoded.
+    const cdnAesKeyB64 = Buffer.from(aesKeyHex, 'utf8').toString('base64')
+    const mediaItem: Record<string, unknown> = {
+      media: { encrypt_query_param: downloadParam, aes_key: cdnAesKeyB64, encrypt_type: 1 },
+    }
+    if (itemType === ITEM_TYPE_IMAGE) mediaItem.mid_size = paddedSize
+    else if (itemType === ITEM_TYPE_VIDEO) mediaItem.video_size = paddedSize
+    else if (itemType === ITEM_TYPE_FILE) {
+      mediaItem.file_name = attachment.name ?? 'file'
+      mediaItem.len = String(raw.length)
+    }
+    await sendItems(userId, contextToken, clientId, [{ type: itemType, [itemKey]: mediaItem }])
+  }
+
+  /** Fetch and decrypt the bytes behind an inbound media attachment. */
+  async function resolveAttachment(attachment: ChannelAttachment): Promise<ResolvedAttachment> {
+    if (attachment.ref === undefined) {
+      throw new ChannelGatewayError('weixin cannot resolve an attachment without a ref')
+    }
+    let descriptor: WeixinMediaRef
+    try {
+      descriptor = JSON.parse(Buffer.from(attachment.ref, 'base64url').toString('utf8')) as WeixinMediaRef
+    } catch {
+      throw new ChannelGatewayError('weixin attachment ref is not one this channel minted')
+    }
+    const candidates: string[] = []
+    if (descriptor.u !== undefined && descriptor.u !== '') candidates.push(descriptor.u)
+    if (descriptor.e !== undefined && descriptor.e !== '') {
+      candidates.push(`${cdnBaseUrl}/download?encrypted_query_param=${encodeURIComponent(descriptor.e)}`)
+    }
+    if (candidates.length === 0) {
+      throw new ChannelGatewayError('weixin attachment ref carries no download locator')
+    }
+    // Prefer image_item.aeskey (hex) as the reference client does, then media.aes_key.
+    const keyB64 = descriptor.h !== undefined && descriptor.h !== ''
+      ? Buffer.from(descriptor.h, 'hex').toString('base64')
+      : descriptor.a ?? ''
+
+    let lastError: unknown
+    for (const url of candidates) {
+      try {
+        const response = await fetchImpl(url)
+        if (!response.ok) throw new ChannelGatewayError(`weixin media download was rejected: HTTP ${String(response.status)}`)
+        const encrypted = Buffer.from(await response.arrayBuffer())
+        const bytes = keyB64 === '' ? encrypted : decryptAesEcb(encrypted, keyB64)
+        return {
+          bytes: new Uint8Array(bytes),
+          ...(descriptor.n === undefined ? {} : { name: descriptor.n }),
+        }
+      } catch (error: unknown) {
+        lastError = error
+      }
+    }
+    throw new Error(redact(`weixin media download failed: ${errorText(lastError)}`))
+  }
+
   const capabilities: ChannelCapabilities = {
-    attachments: false,
+    attachments: true,
+    attachmentDownload: true,
     buttons: false,
     edit: false,
     replyTo: false,
@@ -397,44 +613,30 @@ export function createWeixinChannel(options: WeixinChannelOptions): Channel {
     },
     async send(message: OutboundMessage): Promise<ChannelSendResult> {
       const target = parseRoute(message.route)
-      if ((message.attachments?.length ?? 0) > 0) {
-        throw new ChannelGatewayError('weixin cannot send attachments yet: this adapter carries text only')
-      }
       const chunks = message.format === 'markdown'
         ? splitWeixinMarkdown(message.text, WEIXIN_MAX_TEXT_LENGTH)
         : splitText(message.text, WEIXIN_MAX_TEXT_LENGTH)
-      if (chunks.length === 0) {
+      const attachments = message.attachments ?? []
+      if (chunks.length === 0 && attachments.length === 0) {
         throw new ChannelGatewayError('weixin send carried neither text nor attachments')
       }
       const contextToken = await resolveContextToken(target.userId, target.contextToken)
       // The protocol answers a send with an empty body, so the id the caller
-      // gets back is the client id this adapter minted. Each chunk carries its
-      // own, so a retried chunk is idempotent rather than a duplicate.
+      // gets back is the delivery id this adapter minted. Each part carries its
+      // own client id, so a retried part is idempotent rather than a duplicate.
       const deliveryId = `dsh-channel-gateway:${String(Date.now())}-${randomBytes(4).toString('hex')}`
-      for (const [index, chunk] of chunks.entries()) {
-        await withRetry(() => request('ilink/bot/sendmessage', {
-          msg: {
-            from_user_id: '',
-            to_user_id: target.userId,
-            client_id: `${deliveryId}.${String(index)}`,
-            message_type: MESSAGE_TYPE_BOT,
-            message_state: MESSAGE_STATE_FINISH,
-            item_list: [{ type: ITEM_TYPE_TEXT, text_item: { text: chunk } }],
-            ...(contextToken === '' ? {} : { context_token: contextToken }),
-          },
-        }, undefined), {
-          retries: 3,
-          baseDelayMs: 500,
-          // A WeixinApiError is a rejection the server means (bad token, budget,
-          // bad argument); only transport failures are worth another try.
-          isRetryable: (error: unknown): boolean => !(error instanceof WeixinApiError),
-          onRetry: (error: unknown, waitMs: number): void => {
-            log.error(`weixin: send failed, retrying in ${String(waitMs)}ms: ${errorText(error)}`)
-          },
-        })
+      let part = 0
+      for (const chunk of chunks) {
+        await sendItems(target.userId, contextToken, `${deliveryId}.${String(part)}`, [{ type: ITEM_TYPE_TEXT, text_item: { text: chunk } }])
+        part += 1
+      }
+      for (const attachment of attachments) {
+        await uploadMedia(target.userId, contextToken, `${deliveryId}.${String(part)}`, attachment)
+        part += 1
       }
       return { providerMessageId: deliveryId }
     },
+    resolveAttachment,
   }
 }
 
@@ -443,6 +645,7 @@ export interface WeixinPluginConfig {
   /** iLink bot token; falls back to `DSH_WEIXIN_TOKEN`. */
   token?: string
   baseUrl?: string
+  cdnBaseUrl?: string
   appId?: string
   routeTag?: string
   pollTimeoutSec?: number
@@ -454,6 +657,7 @@ export const inject = ['channels']
 export const Config: Schema<WeixinPluginConfig> = Schema.object({
   token: Schema.string().default(''),
   baseUrl: Schema.string().default(WEIXIN_DEFAULT_BASE_URL),
+  cdnBaseUrl: Schema.string().default(WEIXIN_DEFAULT_CDN_BASE_URL),
   appId: Schema.string().default(''),
   routeTag: Schema.string().default(''),
   pollTimeoutSec: Schema.number().default(35),
@@ -468,9 +672,11 @@ export function apply(ctx: Context, config: WeixinPluginConfig): void {
     return
   }
   const routeTag = config.routeTag ?? ''
+  const cdnBaseUrl = config.cdnBaseUrl ?? ''
   const channel = createWeixinChannel({
     token,
     baseUrl: config.baseUrl ?? WEIXIN_DEFAULT_BASE_URL,
+    ...(cdnBaseUrl === '' ? {} : { cdnBaseUrl }),
     appId: config.appId ?? '',
     pollTimeoutSec: config.pollTimeoutSec ?? 35,
     ...(routeTag === '' ? {} : { routeTag }),

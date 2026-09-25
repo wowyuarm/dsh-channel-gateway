@@ -18,9 +18,9 @@ versionable. Field-by-field reference in [`docs/architecture.md`](docs/architect
 | Surface | Shape |
 | --- | --- |
 | Inbound | `InboundMessage { channel, providerMessageId, actor, place, visibility, text, attachments?, timestamp, replyTo?, raw? }` |
-| Outbound | `OutboundMessage { channel, route, text, attachments?, replyTo? }` |
-| A transport | `Channel { name, capabilities, start(inbox), stop(), send(message) }` |
-| The gateway | `ctx.channels.register(channel)` · `ctx.channels.send(message)` · event `channel/inbound` |
+| Outbound | `OutboundMessage { channel, route, text, attachments?, replyTo?, format? }` |
+| A transport | `Channel { name, capabilities, start(inbox), stop(), send(message), resolveAttachment? }` |
+| The gateway | `ctx.channels.register(channel)` · `ctx.channels.send(message)` · `ctx.channels.resolveAttachment(channel, attachment)` · event `channel/inbound` |
 | Authorization | `ChannelAuth { authorize(request) }`, defaulting to an allowlist |
 
 Three parts of the contract exist because a consumer needs them and a provider
@@ -94,8 +94,8 @@ async function handle(message: InboundMessage) {
 
 | Adapter | Transport | Entry | Notes |
 | --- | --- | --- | --- |
-| Telegram | Bot API long poll (`getUpdates`) | `@wowyuarm/dsh-channel-gateway/telegram` | Text, documents, photos, audio, video; attachments send by provider ref or URL, not by local upload. `DSH_TELEGRAM_TOKEN` is the fallback for `config.token`. |
-| Weixin | WeChat iLink long poll (`ilink/bot/getupdates`) | `@wowyuarm/dsh-channel-gateway/weixin` | Text only. A reply quotes the inbound `context_token`, which WeChat expires after roughly two minutes; media is reported inbound but not fetched or sent. Starts from a token it is given — the QR login flow is not implemented yet. |
+| Telegram | Bot API long poll (`getUpdates`) | `@wowyuarm/dsh-channel-gateway/telegram` | Text and media. An attachment sends from local bytes (`data`), else a provider `ref` or `url`; `resolveAttachment` reads an inbound attachment's bytes by download. `format: 'markdown'` renders as Telegram HTML. `DSH_TELEGRAM_TOKEN` is the fallback for `config.token`. |
+| Weixin | WeChat iLink long poll (`ilink/bot/getupdates`) | `@wowyuarm/dsh-channel-gateway/weixin` | Text and media. A reply quotes the inbound `context_token`, which WeChat expires after roughly two minutes; the adapter refreshes a stale one before sending. `format: 'markdown'` renders as sanitized WeChat Markdown. The media download/upload path follows the reference iLink protocol and is **not yet verified against a live account**. Starts from a token it is given — the QR login flow is not implemented yet. |
 
 Both adapters honour `HTTPS_PROXY`/`NO_PROXY` (Node's own fetch does not, unless
 `NODE_USE_ENV_PROXY` is set).
