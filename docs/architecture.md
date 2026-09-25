@@ -154,6 +154,24 @@ A message whose `message_type` is `2` is this bot's own send coming back, and is
 not inbound. `errcode -14` means the token is stale: polling stops rather than
 retrying forever.
 
+## Host compatibility
+
+The package's host coupling is two versions: `@deepseek-ai/cordis` for the plugin
+and service API, and `@deepseek-ai/schemastery` for row config. Both are peers,
+and `scripts/check-boundaries.mjs` rejects every other non-relative, non-builtin
+import, so a DSH release reaches this package only by changing one of those two.
+
+The peers are declared `^4.0.1` / `^3.18.1` while the devDependencies pin
+`4.0.4` / `3.18.4` — the pair DSH `0.1.7-rc.1` and `0.1.7-rc.2` ship. The floor
+still admits the older `latest` line (`0.1.5-rc.3` ships `4.0.2` / `3.18.2`),
+the ceiling admits the current one, and the two ranges overlap, so one published
+version pairs with either without resolving a second copy of cordis into the
+profile.
+
+DSH's own compatibility preflight reads `@deepseek-ai/dsh` and
+`@deepseek-ai/dsh-*` peers; this package declares none, so the mount check in the
+README is the host-side guard, run by hand when a DSH line advances.
+
 ## Known gaps
 
 - **Weixin has no login flow.** It starts from a token it is given; the iLink QR

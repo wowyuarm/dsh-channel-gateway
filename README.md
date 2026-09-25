@@ -100,6 +100,43 @@ async function handle(message: InboundMessage) {
 Both adapters honour `HTTPS_PROXY`/`NO_PROXY` (Node's own fetch does not, unless
 `NODE_USE_ENV_PROXY` is set).
 
+## Compatibility
+
+A DSH release can reach this package only through the two published packages it
+imports: `@deepseek-ai/cordis` (the plugin and service API) and
+`@deepseek-ai/schemastery` (row config). No `@deepseek-ai/dsh-*` package is
+imported — `npm run check:boundaries` fails the build if one appears — so the
+host coupling is exactly those two versions.
+
+| Runtime | cordis | schemastery | Verified by |
+| --- | --- | --- | --- |
+| DSH `0.1.5-rc.3` (npm `latest`) | `4.0.2` | `3.18.2` | the `0.1.0` release: `npm run typecheck`, `npm test`, `npm run build` |
+| DSH `0.1.7-rc.1` · `0.1.7-rc.2` (npm `next`) | `4.0.4` | `3.18.4` | the same three checks, plus a real row mount in a booted profile |
+| Declared peer floor | `4.0.1` | `3.18.1` | the same three checks |
+
+The devDependencies pin the second row, so a checkout typechecks, tests and
+builds against what the current DSH ships. The declared peers stay at
+`^4.0.1` / `^3.18.1`: the floor admits the older DSH line, the ceiling admits
+the current one, and the two ranges overlap, so one published version installs
+against either without a second copy of cordis in the profile.
+
+Re-verify against a running DSH:
+
+```sh
+npm run build
+cat > /tmp/channel-gateway.yml <<'EOF'
+- insert:
+    - id: channel-gateway
+      name: 'file:///absolute/path/to/dsh-channel-gateway/lib/index.js'
+EOF
+dsh --profile <profile> --patch /tmp/channel-gateway.yml --help
+```
+
+A row that fails to import is reported on stderr as `N entry did not activate`
+with its reason; a clean run prints no such line. To assert the service seam
+rather than the import alone, add a second row to the overlay that declares
+`inject: ['channels']` and reads `ctx.channels.send` from it.
+
 ## Development
 
 ```sh

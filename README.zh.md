@@ -85,6 +85,39 @@ export function apply(ctx: Context) {
 
 两个适配器都尊重 `HTTPS_PROXY`/`NO_PROXY`（Node 自带 fetch 默认不读这两个变量）。
 
+## 兼容性
+
+DSH 的版本变化只可能经由本包 import 的两个已发布包传导到此处：`@deepseek-ai/cordis`
+（插件与 service API）和 `@deepseek-ai/schemastery`（行配置）。本包不 import 任何
+`@deepseek-ai/dsh-*` 包——一旦出现，`npm run check:boundaries` 直接让构建失败——
+所以宿主耦合就是这两个版本。
+
+| 运行时 | cordis | schemastery | 验证方式 |
+| --- | --- | --- | --- |
+| DSH `0.1.5-rc.3`（npm `latest`） | `4.0.2` | `3.18.2` | `0.1.0` 发布时：`npm run typecheck`、`npm test`、`npm run build` |
+| DSH `0.1.7-rc.1` · `0.1.7-rc.2`（npm `next`） | `4.0.4` | `3.18.4` | 同上三项，外加在真实 profile 里装载该行 |
+| 声明的 peer 下界 | `4.0.1` | `3.18.1` | 同上三项 |
+
+devDependencies 钉住第二行，所以检出后的 typecheck／测试／构建跑的就是当前 DSH 实际装载的版本。
+peer 区间保持 `^4.0.1` / `^3.18.1`：下界容纳旧 DSH 线，上界容纳当前线，两者有交集，
+因此同一个已发布版本对两条线都能安装，而不会在 profile 里解析出第二份 cordis。
+
+针对正在运行的 DSH 复验：
+
+```sh
+npm run build
+cat > /tmp/channel-gateway.yml <<'EOF'
+- insert:
+    - id: channel-gateway
+      name: 'file:///absolute/path/to/dsh-channel-gateway/lib/index.js'
+EOF
+dsh --profile <profile> --patch /tmp/channel-gateway.yml --help
+```
+
+装载失败的行会在 stderr 报 `N entry did not activate` 并给出原因；干净运行不会打印这一行。
+若要断言 service 接缝而不只是 import，可在 overlay 里再加一行声明 `inject: ['channels']`
+并从中读取 `ctx.channels.send`。
+
 ## 开发
 
 ```sh
