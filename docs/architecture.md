@@ -133,9 +133,11 @@ owns that work — the acceptance step a consumer is expected to implement.
 
 Updates with no message, and messages with no sender (channel posts), are
 skipped — but the poll offset still advances past them, so one unusable update
-cannot block the stream behind it. Sends split text at 4096 characters, and an
-attachment is sent by its provider `ref` or `url`; a local upload is not part of
-this adapter.
+cannot block the stream behind it. Sends split text at 4096 characters, breaking
+at the last line break in range, else the last space, else the limit — never
+between the two halves of a surrogate pair, and the chunks join back to the
+original text. An attachment is sent by its provider `ref` or `url`; a local
+upload is not part of this adapter.
 
 ### Weixin
 

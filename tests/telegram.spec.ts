@@ -168,6 +168,35 @@ describe('telegram channel', () => {
     expect(result.providerMessageId).toBe('7')
   })
 
+  it('breaks a long message at a line boundary instead of mid-word', async () => {
+    const { impl, calls } = fakeTelegram(() => ({ message_id: 7 }))
+    const channel = createTelegramChannel({ token: 'TESTTOKEN', fetch: impl })
+    const text = `${'w'.repeat(99)} `.repeat(60).trimEnd()
+
+    await channel.send({ channel: 'telegram', route: 'chat:42', text })
+
+    const chunks = calls.filter(call => call.method === 'sendMessage').map(call => String(call.body?.text))
+    expect(chunks.join('')).toBe(text)
+    expect(chunks.every(chunk => chunk.length <= TELEGRAM_MAX_TEXT_LENGTH)).toBe(true)
+    expect(chunks).toHaveLength(2)
+    expect(chunks[0]?.endsWith(' ')).toBe(true)
+  })
+
+  it('never cuts a surrogate pair in half', async () => {
+    const { impl, calls } = fakeTelegram(() => ({ message_id: 7 }))
+    const channel = createTelegramChannel({ token: 'TESTTOKEN', fetch: impl })
+    const text = `${'a'.repeat(TELEGRAM_MAX_TEXT_LENGTH - 1)}${'🙂'.repeat(3)}`
+
+    await channel.send({ channel: 'telegram', route: 'chat:42', text })
+
+    const chunks = calls.filter(call => call.method === 'sendMessage').map(call => String(call.body?.text))
+    expect(chunks.join('')).toBe(text)
+    for (const chunk of chunks) {
+      expect(/[\uD800-\uDBFF]$/u.test(chunk)).toBe(false)
+      expect(/^[\uDC00-\uDFFF]/u.test(chunk)).toBe(false)
+    }
+  })
+
   it('refuses a route another channel minted', async () => {
     const { impl } = fakeTelegram(() => ({ message_id: 7 }))
     const channel = createTelegramChannel({ token: 'TESTTOKEN', fetch: impl })
