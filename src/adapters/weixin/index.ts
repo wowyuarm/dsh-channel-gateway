@@ -9,8 +9,10 @@
  *
  * Two transport facts a consumer needs: a reply carries the inbound message's
  * `context_token`, which WeChat expires server-side after roughly two minutes,
- * and this adapter carries text only — media items are reported inbound but
- * cannot be fetched or sent yet.
+ * and this adapter refreshes a stale one before sending; media travels both
+ * ways through the iLink CDN — an inbound attachment comes back through
+ * `resolveAttachment`, an outbound one goes up from its `data` — a path that
+ * follows the reference protocol and is not yet verified against a live account.
  * @module @wowyuarm/dsh-channel-gateway/weixin
  */
 
