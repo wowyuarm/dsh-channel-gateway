@@ -50,3 +50,36 @@ export function delay(ms: number, signal: AbortSignal | undefined): Promise<void
     signal.addEventListener('abort', onAbort, { once: true })
   })
 }
+
+/** How a send decides whether a failure is worth trying again, and how long to wait. */
+export interface RetryPolicy {
+  /** Attempts after the first, e.g. 3 means up to four calls in all. */
+  readonly retries: number
+  /** First backoff; doubled each further attempt. */
+  readonly baseDelayMs: number
+  /** Whether this error is transient rather than a rejection the provider means. */
+  isRetryable(error: unknown): boolean
+  /** A provider-dictated wait (Telegram's `retry_after`), preferred over backoff. */
+  retryAfterMs?(error: unknown): number | undefined
+  /** Reported once per retry, so a wedged provider is visible in the log. */
+  onRetry?(error: unknown, waitMs: number): void
+}
+
+/**
+ * Run `operation`, retrying transient failures with exponential backoff. Only
+ * sends use this: a failed send otherwise loses a reply to a network blip or a
+ * rate limit, while polling has its own loop. A non-retryable error, or the
+ * last attempt's error, is rethrown unchanged.
+ */
+export async function withRetry<T>(operation: () => Promise<T>, policy: RetryPolicy): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation()
+    } catch (error: unknown) {
+      if (attempt >= policy.retries || !policy.isRetryable(error)) throw error
+      const waitMs = policy.retryAfterMs?.(error) ?? policy.baseDelayMs * 2 ** attempt
+      policy.onRetry?.(error, waitMs)
+      await delay(waitMs, undefined)
+    }
+  }
+}

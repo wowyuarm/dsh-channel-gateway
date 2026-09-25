@@ -23,11 +23,13 @@ import type {
   ChannelVisibility,
   InboundMessage,
   OutboundMessage,
-} from '../contracts.ts'
-import { ChannelGatewayError, errorText } from '../errors.ts'
-import type {} from '../gateway.ts'
-import { delay, proxyAwareFetch } from './http.ts'
-import { silentLog, type AdapterLog } from './log.ts'
+} from '../../contracts.ts'
+import { ChannelGatewayError, errorText } from '../../errors.ts'
+import type {} from '../../gateway.ts'
+import { delay, proxyAwareFetch, withRetry } from '../http.ts'
+import { silentLog, type AdapterLog } from '../log.ts'
+import { splitTelegramHtml } from './markdown.ts'
+import { splitText } from '../text.ts'
 
 /** Telegram's own limit for one message's text. */
 export const TELEGRAM_MAX_TEXT_LENGTH = 4096
@@ -83,6 +85,41 @@ interface TelegramResponse<T> {
   ok: boolean
   result?: T
   description?: string
+  error_code?: number
+  parameters?: { retry_after?: number }
+}
+
+/**
+ * A failure the Bot API reported in its own envelope, carrying enough to decide
+ * whether a send should try again: HTTP 5xx and error code 429 are transient,
+ * and 429 comes with the `retry_after` the API wants honoured. A `fetch` that
+ * throws is a transport failure and stays a plain {@link Error}, also transient.
+ */
+class TelegramApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly errorCode: number | undefined,
+    readonly retryAfterSec: number | undefined,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'TelegramApiError'
+  }
+}
+
+/** A send retries transport failures and rate limits, but not a real rejection. */
+function telegramSendRetries(retryDelayMs: number, log: AdapterLog): Parameters<typeof withRetry>[1] {
+  return {
+    retries: 3,
+    baseDelayMs: retryDelayMs,
+    isRetryable: (error: unknown): boolean =>
+      !(error instanceof TelegramApiError) || error.status >= 500 || error.errorCode === 429,
+    retryAfterMs: (error: unknown): number | undefined =>
+      error instanceof TelegramApiError && error.retryAfterSec !== undefined ? error.retryAfterSec * 1000 : undefined,
+    onRetry: (error: unknown, waitMs: number): void => {
+      log.error(`telegram: send failed, retrying in ${String(waitMs)}ms: ${errorText(error)}`)
+    },
+  }
 }
 
 /** How one telegram channel is built; the plugin row supplies it. */
@@ -94,6 +131,8 @@ export interface TelegramChannelOptions {
   readonly pollingTimeoutSec?: number
   /** How long to wait after a failed poll before polling again. */
   readonly retryDelayMs?: number
+  /** Client-side ceiling for one long poll, over the server's own hold. */
+  readonly pollWatchdogMs?: number
   readonly log?: AdapterLog
 }
 
@@ -141,48 +180,6 @@ function attachmentsOf(message: TelegramMessage): readonly ChannelAttachment[] {
   return found
 }
 
-/** Split text no chunk of which exceeds `limit`; `''` yields no chunk at all. */
-function splitText(text: string, limit: number): string[] {
-  if (text === '') return []
-  const chunks: string[] = []
-  let rest = text
-  while (rest.length > limit) {
-    const cut = breakAt(rest, limit)
-    chunks.push(rest.slice(0, cut))
-    rest = rest.slice(cut)
-  }
-  chunks.push(rest)
-  return chunks
-}
-
-/** Whether one UTF-16 unit is the first half of a surrogate pair. */
-function isHighSurrogate(unit: number): boolean {
-  return unit >= 0xd800 && unit <= 0xdbff
-}
-
-/** Whether one UTF-16 unit is the second half of a surrogate pair. */
-function isLowSurrogate(unit: number): boolean {
-  return unit >= 0xdc00 && unit <= 0xdfff
-}
-
-/**
- * How much of `text` the first chunk takes: the last line break in range, else
- * the last space, else the limit itself. The result is always positive and never
- * exceeds `limit`, so `splitText` advances, and it never lands between the two
- * halves of a surrogate pair — that would send half a character.
- */
-function breakAt(text: string, limit: number): number {
-  let end = limit
-  if (isHighSurrogate(text.charCodeAt(end - 1)) && isLowSurrogate(text.charCodeAt(end))) end -= 1
-  if (end <= 0) return limit
-  const window = text.slice(0, end)
-  const newline = window.lastIndexOf('\n')
-  if (newline > 0) return newline + 1
-  const space = window.lastIndexOf(' ')
-  if (space > 0) return space + 1
-  return end
-}
-
 /**
  * Build the telegram channel. The gateway registers it; `start` begins polling
  * and `stop` ends it. Every provider call is one HTTP request, so a test can
@@ -195,7 +192,12 @@ export function createTelegramChannel(options: TelegramChannelOptions): Channel 
   const apiBaseUrl = options.apiBaseUrl ?? 'https://api.telegram.org'
   const pollingTimeoutSec = options.pollingTimeoutSec ?? 30
   const retryDelayMs = options.retryDelayMs ?? 3000
+  // A long poll should return by the server-held `pollingTimeoutSec`; if the
+  // socket wedges it never does, so a client ceiling above that aborts and
+  // restarts the poll rather than letting the loop hang forever.
+  const pollWatchdogMs = options.pollWatchdogMs ?? (pollingTimeoutSec + 15) * 1000
   const log = options.log ?? silentLog
+  const sendPolicy = telegramSendRetries(500, log)
 
   let running = false
   let abort: AbortController | undefined
@@ -219,7 +221,12 @@ export function createTelegramChannel(options: TelegramChannelOptions): Channel 
     const payload = (await response.json().catch(() => undefined)) as TelegramResponse<T> | undefined
     if (payload === undefined || payload.ok !== true || payload.result === undefined) {
       const description = payload?.description ?? `HTTP ${String(response.status)}`
-      throw new Error(redact(`telegram ${method} was rejected: ${description}`))
+      throw new TelegramApiError(
+        response.status,
+        payload?.error_code,
+        payload?.parameters?.retry_after,
+        redact(`telegram ${method} was rejected: ${description}`),
+      )
     }
     return payload.result
   }
@@ -279,7 +286,7 @@ export function createTelegramChannel(options: TelegramChannelOptions): Channel 
         `telegram cannot send a ${attachment.kind} attachment without a url or a ref; local uploads are not part of this adapter`,
       )
     }
-    const sent = await call<TelegramMessage>(method, { chat_id: chatId, [field]: handle })
+    const sent = await withRetry(() => call<TelegramMessage>(method, { chat_id: chatId, [field]: handle }), sendPolicy)
     return sent.message_id
   }
 
@@ -287,14 +294,22 @@ export function createTelegramChannel(options: TelegramChannelOptions): Channel 
     let offset: number | undefined
     while (running && !signal.aborted) {
       let updates: TelegramUpdate[]
+      // Abort a poll that outlives the watchdog: the stop signal, or a timeout
+      // over the server hold, whichever fires first.
+      const watchdog = AbortSignal.timeout(pollWatchdogMs)
+      const pollSignal = AbortSignal.any([signal, watchdog])
       try {
         updates = await call<TelegramUpdate[]>('getUpdates', {
           timeout: pollingTimeoutSec,
           allowed_updates: ['message'],
           ...(offset === undefined ? {} : { offset }),
-        }, signal)
+        }, pollSignal)
       } catch (error: unknown) {
         if (!running || signal.aborted) return
+        if (watchdog.aborted) {
+          log.info('telegram: a poll outran the watchdog and was restarted')
+          continue
+        }
         log.error(`telegram: getUpdates failed, retrying: ${errorText(error)}`)
         await delay(retryDelayMs, signal)
         continue
@@ -342,10 +357,15 @@ export function createTelegramChannel(options: TelegramChannelOptions): Channel 
     async send(message: OutboundMessage): Promise<ChannelSendResult> {
       const chatId = chatIdOf(message.route)
       let last: number | undefined
-      for (const [index, chunk] of splitText(message.text, TELEGRAM_MAX_TEXT_LENGTH).entries()) {
+      const markdown = message.format === 'markdown'
+      const chunks = markdown
+        ? splitTelegramHtml(message.text, TELEGRAM_MAX_TEXT_LENGTH)
+        : splitText(message.text, TELEGRAM_MAX_TEXT_LENGTH)
+      for (const [index, chunk] of chunks.entries()) {
         const body: Record<string, unknown> = { chat_id: chatId, text: chunk }
+        if (markdown) body.parse_mode = 'HTML'
         if (index === 0 && message.replyTo !== undefined) body.reply_to_message_id = Number(message.replyTo)
-        const sent = await call<TelegramMessage>('sendMessage', body)
+        const sent = await withRetry(() => call<TelegramMessage>('sendMessage', body), sendPolicy)
         last = sent.message_id
       }
       for (const attachment of message.attachments ?? []) {

@@ -87,6 +87,9 @@ export interface InboundMessage {
   readonly raw?: unknown
 }
 
+/** How an outbound text should be rendered by the channel that carries it. */
+export type OutboundTextFormat = 'plain' | 'markdown'
+
 /** One normalized outbound message. */
 export interface OutboundMessage {
   /** The registered channel to send through. */
@@ -97,6 +100,13 @@ export interface OutboundMessage {
   readonly attachments?: readonly ChannelAttachment[]
   /** The provider message id to answer, when answering one. */
   readonly replyTo?: string
+  /**
+   * How to render {@link OutboundMessage.text}. `markdown` asks the channel to
+   * render it into whatever that provider displays formatted text as (Telegram
+   * HTML, sanitized WeChat Markdown, ...). Omitted means `plain`: the text is
+   * sent verbatim, so a consumer that has not opted in sees no transformation.
+   */
+  readonly format?: OutboundTextFormat
 }
 
 /** What one send produced. */

@@ -23,12 +23,12 @@
       "default": "./lib/index.js"
     },
     "./telegram": {
-      "types": "./lib/adapters/telegram.d.ts",
-      "default": "./lib/adapters/telegram.js"
+      "types": "./lib/adapters/telegram/index.d.ts",
+      "default": "./lib/adapters/telegram/index.js"
     },
     "./weixin": {
-      "types": "./lib/adapters/weixin.d.ts",
-      "default": "./lib/adapters/weixin.js"
+      "types": "./lib/adapters/weixin/index.d.ts",
+      "default": "./lib/adapters/weixin/index.js"
     },
     "./package.json": "./package.json"
   },

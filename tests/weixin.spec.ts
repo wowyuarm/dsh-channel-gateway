@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { WEIXIN_MAX_TEXT_LENGTH, createWeixinChannel } from '../src/adapters/weixin.ts'
+import { WEIXIN_MAX_TEXT_LENGTH, createWeixinChannel } from '../src/adapters/weixin/index.ts'
 import type { ChannelInbox, InboundMessage } from '../src/contracts.ts'
 import { ChannelGatewayError } from '../src/errors.ts'
 
@@ -212,6 +212,45 @@ describe('weixin channel', () => {
     expect(sends).toHaveLength(2)
     const first = sends[0]?.body.msg as { item_list?: readonly { text_item?: { text?: string } }[] } | undefined
     expect(first?.item_list?.[0]?.text_item?.text).toHaveLength(WEIXIN_MAX_TEXT_LENGTH)
+    // Each chunk carries its own client id, so a retry cannot duplicate one.
+    const clientIds = sends.map(call => (call.body.msg as { client_id?: string }).client_id)
+    expect(clientIds[0]).not.toBe(clientIds[1])
+  })
+
+  it('refreshes a stale context token via getconfig before sending', async () => {
+    // A route for a user never seen inbound has no cached age, so the token is
+    // treated as stale and refreshed before use.
+    const userId = Buffer.from('wxid_unseen', 'utf8').toString('base64url')
+    const oldToken = Buffer.from('old-token', 'utf8').toString('base64url')
+    const route = `wx:${userId}.${oldToken}`
+    const { impl, calls } = fakeWeixin(endpoint => (endpoint === 'getconfig' ? { context_token: 'fresh-token' } : {}))
+    const channel = createWeixinChannel({ token: 'TOKEN', fetch: impl })
+
+    await channel.send({ channel: 'weixin', route, text: 'hi' })
+
+    const getconfig = calls.find(call => call.endpoint === 'getconfig')
+    expect((getconfig?.body as { context_token?: string }).context_token).toBe('old-token')
+    const send = calls.find(call => call.endpoint === 'sendmessage')
+    expect((send?.body.msg as { context_token?: string }).context_token).toBe('fresh-token')
+  })
+
+  it('retries a send after a transient transport failure', async () => {
+    let attempts = 0
+    const impl = (async (input: Parameters<typeof fetch>[0]) => {
+      const endpoint = String(input).split('/ilink/bot/')[1]
+      if (endpoint === 'sendmessage') {
+        attempts += 1
+        if (attempts === 1) throw new Error('ECONNRESET')
+      }
+      return { ok: true, status: 200, json: () => Promise.resolve({}) } as unknown as Response
+    }) as unknown as typeof fetch
+    const userId = Buffer.from('wxid_x', 'utf8').toString('base64url')
+    const route = `wx:${userId}.${Buffer.from('t', 'utf8').toString('base64url')}`
+    const channel = createWeixinChannel({ token: 'TOKEN', fetch: impl })
+
+    const result = await channel.send({ channel: 'weixin', route, text: 'hi' })
+    expect(attempts).toBe(2)
+    expect(result.providerMessageId.startsWith('dsh-channel-gateway:')).toBe(true)
   })
 
   it('refuses a foreign route, an attachment, and an empty send', async () => {

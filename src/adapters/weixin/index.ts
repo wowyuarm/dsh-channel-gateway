@@ -30,11 +30,13 @@ import type {
   ChannelVisibility,
   InboundMessage,
   OutboundMessage,
-} from '../contracts.ts'
-import { ChannelGatewayError, errorText } from '../errors.ts'
-import type {} from '../gateway.ts'
-import { delay, proxyAwareFetch } from './http.ts'
-import { silentLog, type AdapterLog } from './log.ts'
+} from '../../contracts.ts'
+import { ChannelGatewayError, errorText } from '../../errors.ts'
+import type {} from '../../gateway.ts'
+import { delay, proxyAwareFetch, withRetry } from '../http.ts'
+import { silentLog, type AdapterLog } from '../log.ts'
+import { splitText } from '../text.ts'
+import { splitWeixinMarkdown } from './markdown.ts'
 
 /** This adapter's own split threshold; a longer text becomes several messages. */
 export const WEIXIN_MAX_TEXT_LENGTH = 2048
@@ -54,6 +56,13 @@ const MESSAGE_STATE_FINISH = 2
 const ITEM_TYPE_TEXT = 1
 
 const ROUTE_PREFIX = 'wx:'
+
+/**
+ * How long a context token is trusted before a send refreshes it. iLink expires
+ * a token server-side after a short idle window (about two minutes), so a reply
+ * to a long agent turn would otherwise be sent against a dead token and lost.
+ */
+const CONTEXT_TOKEN_MAX_AGE_MS = 80_000
 
 /** One failure the iLink API reported in its own envelope. */
 export class WeixinApiError extends Error {
@@ -106,6 +115,11 @@ interface GetUpdatesResponse {
   longpolling_timeout_ms?: number
 }
 
+/** The `getconfig` reply, read only for the fresh context token it may carry. */
+interface GetConfigResponse {
+  context_token?: string
+}
+
 /** How one weixin channel is built; the plugin row supplies it. */
 export interface WeixinChannelOptions {
   readonly token: string
@@ -126,7 +140,7 @@ export interface WeixinChannelOptions {
 /** This package's own version, for the protocol's `base_info`. */
 function bundleVersion(): string {
   try {
-    const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { version?: unknown }
+    const manifest = JSON.parse(readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')) as { version?: unknown }
     return typeof manifest.version === 'string' ? manifest.version : 'unknown'
   } catch {
     return 'unknown'
@@ -199,19 +213,6 @@ function textOf(items: readonly WeixinItem[]): string {
   return parts.join('\n')
 }
 
-/** Split text no chunk of which exceeds `limit`; `''` yields no chunk at all. */
-function splitText(text: string, limit: number): string[] {
-  if (text === '') return []
-  const chunks: string[] = []
-  let rest = text
-  while (rest.length > limit) {
-    chunks.push(rest.slice(0, limit))
-    rest = rest.slice(limit)
-  }
-  chunks.push(rest)
-  return chunks
-}
-
 /**
  * Build the weixin channel. The gateway registers it; `start` begins polling
  * and `stop` ends it. Every provider call is one HTTP request, so a test can
@@ -234,6 +235,9 @@ export function createWeixinChannel(options: WeixinChannelOptions): Channel {
   let running = false
   let abort: AbortController | undefined
   let loop: Promise<void> | undefined
+  // The freshest context token seen per user, and when: a send refreshes it
+  // before use if it has gone stale.
+  const contextTokens = new Map<string, { token: string; at: number }>()
 
   function redact(message: string): string {
     return message.split(token).join('***')
@@ -329,9 +333,40 @@ export function createWeixinChannel(options: WeixinChannelOptions): Channel {
       }
       for (const message of page.msgs ?? []) {
         const normalized = normalize(message)
-        if (normalized !== undefined) inbox.deliver(normalized)
+        if (normalized === undefined) continue
+        // Remember the token that came with this message; it is the freshest one
+        // for this user, and a later send refreshes from it if it ages out.
+        const fromUser = message.from_user_id ?? ''
+        const token = message.context_token ?? ''
+        if (fromUser !== '' && token !== '') contextTokens.set(fromUser, { token, at: Date.now() })
+        inbox.deliver(normalized)
       }
     }
+  }
+
+  /**
+   * The context token a send should use for `userId`: the freshest one known,
+   * refreshed through `getconfig` when it has aged past its trusted window. A
+   * refresh that fails leaves the caller's token in place — better a send that
+   * might still work than none at all.
+   */
+  async function resolveContextToken(userId: string, routeToken: string): Promise<string> {
+    const cached = contextTokens.get(userId)
+    const token = cached?.token ?? routeToken
+    if (token === '') return token
+    const age = Date.now() - (cached?.at ?? 0)
+    if (age < CONTEXT_TOKEN_MAX_AGE_MS) return token
+    try {
+      const config = await request<GetConfigResponse>('ilink/bot/getconfig', { ilink_user_id: userId, context_token: token }, undefined)
+      const fresh = config.context_token ?? ''
+      if (fresh !== '') {
+        contextTokens.set(userId, { token: fresh, at: Date.now() })
+        return fresh
+      }
+    } catch (error: unknown) {
+      log.error(`weixin: could not refresh a stale context token, using it as is: ${errorText(error)}`)
+    }
+    return token
   }
 
   const capabilities: ChannelCapabilities = {
@@ -365,27 +400,40 @@ export function createWeixinChannel(options: WeixinChannelOptions): Channel {
       if ((message.attachments?.length ?? 0) > 0) {
         throw new ChannelGatewayError('weixin cannot send attachments yet: this adapter carries text only')
       }
-      const chunks = splitText(message.text, WEIXIN_MAX_TEXT_LENGTH)
+      const chunks = message.format === 'markdown'
+        ? splitWeixinMarkdown(message.text, WEIXIN_MAX_TEXT_LENGTH)
+        : splitText(message.text, WEIXIN_MAX_TEXT_LENGTH)
       if (chunks.length === 0) {
         throw new ChannelGatewayError('weixin send carried neither text nor attachments')
       }
+      const contextToken = await resolveContextToken(target.userId, target.contextToken)
       // The protocol answers a send with an empty body, so the id the caller
-      // gets back is the client id this adapter minted and sent.
-      const clientId = `dsh-channel-gateway:${String(Date.now())}-${randomBytes(4).toString('hex')}`
-      for (const chunk of chunks) {
-        await request('ilink/bot/sendmessage', {
+      // gets back is the client id this adapter minted. Each chunk carries its
+      // own, so a retried chunk is idempotent rather than a duplicate.
+      const deliveryId = `dsh-channel-gateway:${String(Date.now())}-${randomBytes(4).toString('hex')}`
+      for (const [index, chunk] of chunks.entries()) {
+        await withRetry(() => request('ilink/bot/sendmessage', {
           msg: {
             from_user_id: '',
             to_user_id: target.userId,
-            client_id: clientId,
+            client_id: `${deliveryId}.${String(index)}`,
             message_type: MESSAGE_TYPE_BOT,
             message_state: MESSAGE_STATE_FINISH,
             item_list: [{ type: ITEM_TYPE_TEXT, text_item: { text: chunk } }],
-            ...(target.contextToken === '' ? {} : { context_token: target.contextToken }),
+            ...(contextToken === '' ? {} : { context_token: contextToken }),
           },
-        }, undefined)
+        }, undefined), {
+          retries: 3,
+          baseDelayMs: 500,
+          // A WeixinApiError is a rejection the server means (bad token, budget,
+          // bad argument); only transport failures are worth another try.
+          isRetryable: (error: unknown): boolean => !(error instanceof WeixinApiError),
+          onRetry: (error: unknown, waitMs: number): void => {
+            log.error(`weixin: send failed, retrying in ${String(waitMs)}ms: ${errorText(error)}`)
+          },
+        })
       }
-      return { providerMessageId: clientId }
+      return { providerMessageId: deliveryId }
     },
   }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { TELEGRAM_MAX_TEXT_LENGTH, createTelegramChannel } from '../src/adapters/telegram.ts'
+import { TELEGRAM_MAX_TEXT_LENGTH, createTelegramChannel } from '../src/adapters/telegram/index.ts'
 import type { ChannelInbox, InboundMessage, OutboundMessage } from '../src/contracts.ts'
 import { ChannelGatewayError } from '../src/errors.ts'
 
@@ -197,6 +197,27 @@ describe('telegram channel', () => {
     }
   })
 
+  it('renders markdown as HTML and sets parse_mode when format is markdown', async () => {
+    const { impl, calls } = fakeTelegram(() => ({ message_id: 7, date: 0, chat: { id: 42, type: 'private' } }))
+    const channel = createTelegramChannel({ token: 'TESTTOKEN', fetch: impl })
+
+    await channel.send({ channel: 'telegram', route: 'chat:42', text: '**hi** <you>', format: 'markdown' })
+
+    const sent = calls.find(call => call.method === 'sendMessage')
+    expect(sent?.body).toMatchObject({ chat_id: 42, text: '<b>hi</b> &lt;you&gt;', parse_mode: 'HTML' })
+  })
+
+  it('sends plain text with no parse_mode by default', async () => {
+    const { impl, calls } = fakeTelegram(() => ({ message_id: 7, date: 0, chat: { id: 42, type: 'private' } }))
+    const channel = createTelegramChannel({ token: 'TESTTOKEN', fetch: impl })
+
+    await channel.send({ channel: 'telegram', route: 'chat:42', text: '**hi**' })
+
+    const sent = calls.find(call => call.method === 'sendMessage')
+    expect(sent?.body?.text).toBe('**hi**')
+    expect(sent?.body?.parse_mode).toBeUndefined()
+  })
+
   it('refuses a route another channel minted', async () => {
     const { impl } = fakeTelegram(() => ({ message_id: 7 }))
     const channel = createTelegramChannel({ token: 'TESTTOKEN', fetch: impl })
@@ -228,5 +249,58 @@ describe('telegram channel', () => {
     const channel = createTelegramChannel({ token: 'SECRET', fetch: impl })
 
     await expect(channel.start({ deliver: () => {} })).rejects.toThrow(/bot\*\*\*\/getMe/)
+  })
+
+  it('retries a send after a transient transport failure', async () => {
+    let attempts = 0
+    const impl = (async (input: Parameters<typeof fetch>[0]) => {
+      const method = String(input).split('/').at(-1)
+      if (method === 'sendMessage') {
+        attempts += 1
+        if (attempts === 1) throw new Error('ECONNRESET')
+      }
+      return { ok: true, status: 200, json: () => Promise.resolve({ ok: true, result: { message_id: 7 } }) } as unknown as Response
+    }) as unknown as typeof fetch
+    const channel = createTelegramChannel({ token: 'T', fetch: impl })
+
+    const result = await channel.send({ channel: 'telegram', route: 'chat:42', text: 'hi' })
+    expect(attempts).toBe(2)
+    expect(result.providerMessageId).toBe('7')
+  })
+
+  it('does not retry a send the API rejects', async () => {
+    let attempts = 0
+    const impl = (async () => {
+      attempts += 1
+      return { ok: false, status: 400, json: () => Promise.resolve({ ok: false, error_code: 400, description: 'chat not found' }) } as unknown as Response
+    }) as unknown as typeof fetch
+    const channel = createTelegramChannel({ token: 'T', fetch: impl })
+
+    await expect(channel.send({ channel: 'telegram', route: 'chat:42', text: 'hi' })).rejects.toThrow(/chat not found/)
+    expect(attempts).toBe(1)
+  })
+
+  it('restarts a poll that outruns the watchdog', async () => {
+    let polls = 0
+    const impl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const method = String(input).split('/').at(-1)
+      if (method === 'getMe') {
+        return { ok: true, status: 200, json: () => Promise.resolve({ ok: true, result: { id: 1, username: 'b' } }) } as unknown as Response
+      }
+      if (method === 'getUpdates') {
+        polls += 1
+        // Hang until the watchdog (or stop) aborts, mimicking a wedged socket.
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => { reject(new Error('aborted')) }, { once: true })
+        })
+      }
+      return { ok: true, status: 200, json: () => Promise.resolve({ ok: true, result: [] }) } as unknown as Response
+    }) as unknown as typeof fetch
+    const channel = createTelegramChannel({ token: 'T', fetch: impl, pollWatchdogMs: 20, pollingTimeoutSec: 0 })
+
+    await channel.start({ deliver: () => {} })
+    await waitFor(() => polls >= 2, 1000)
+    await channel.stop()
+    expect(polls).toBeGreaterThanOrEqual(2)
   })
 })
